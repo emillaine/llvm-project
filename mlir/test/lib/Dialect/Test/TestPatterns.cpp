@@ -11,6 +11,7 @@
 #include "TestTypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/CommonFolders.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/ControlFlow/Transforms/StructuralTypeConversions.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Func/Transforms/FuncConversions.h"
@@ -468,6 +469,80 @@ public:
   }
 };
 
+/// Exercise reachability changes while a greedy rewrite is processing its
+/// worklist. A new block is either disconnected, connected within the same
+/// rewrite, or inserted before the old entry block. Other modes redirect a
+/// branch, merge blocks, or move and erase a block.
+class CreateBlockDuringGreedyRewrite : public RewritePattern {
+public:
+  CreateBlockDuringGreedyRewrite(MLIRContext *context)
+      : RewritePattern("test.greedy_create_block", /*benefit=*/1, context) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    StringRef mode = cast<StringAttr>(op->getAttr("mode")).getValue();
+    Region *region = op->getParentRegion();
+    Location loc = op->getLoc();
+    if (mode == "observe") {
+      op->emitRemark("processed reachable block");
+    } else if (mode == "move-erase") {
+      auto branch = cast<cf::BranchOp>(op->getBlock()->getTerminator());
+      Block *moved = branch.getDest();
+      rewriter.modifyOpInPlace(branch,
+                               [&] { branch.setDest(&region->back()); });
+      // The source region retains two blocks and its original entry. Erasing
+      // the moved block must not leave a dangling pointer in its cached state.
+      Region temporary;
+      rewriter.moveBlockBefore(moved, &temporary, temporary.end());
+      rewriter.eraseBlock(moved);
+    } else if (mode == "merge" || mode == "merge-disconnect") {
+      Block *dest = op->getBlock();
+      auto branch = cast<cf::BranchOp>(dest->getTerminator());
+      Block *source = branch.getDest();
+      rewriter.eraseOp(branch);
+      rewriter.mergeBlocks(source, dest);
+      if (mode == "merge-disconnect") {
+        auto conditional = cast<cf::CondBranchOp>(dest->getTerminator());
+        rewriter.setInsertionPoint(conditional);
+        cf::BranchOp::create(rewriter, loc, conditional.getTrueDest());
+        rewriter.eraseOp(conditional);
+      }
+    } else if (mode == "entry") {
+      rewriter.createBlock(region, region->begin());
+      func::ReturnOp::create(rewriter, loc);
+    } else if (mode == "redirect") {
+      auto branch = cast<cf::BranchOp>(op->getBlock()->getTerminator());
+      rewriter.modifyOpInPlace(branch,
+                               [&] { branch.setDest(&region->back()); });
+    } else {
+      Block *newBlock = rewriter.createBlock(region);
+      if (mode == "unreachable") {
+        Value input = op->getOperand(0);
+        auto add = arith::AddIOp::create(rewriter, loc, input, input);
+        rewriter.modifyOpInPlace(add, [&] {
+          add->setOperand(0, add.getResult());
+          add->setOperand(1, add.getResult());
+        });
+        cf::BranchOp::create(rewriter, loc, newBlock);
+      } else {
+        assert(mode == "reachable");
+        OperationState state(loc, "test.greedy_create_block");
+        state.addAttribute("mode", rewriter.getStringAttr("observe"));
+        rewriter.create(state);
+        func::ReturnOp::create(rewriter, loc);
+        Operation *oldTerminator = op->getBlock()->getTerminator();
+        rewriter.setInsertionPoint(oldTerminator);
+        Block *oldDest = cast<cf::BranchOp>(oldTerminator).getDest();
+        cf::CondBranchOp::create(rewriter, loc, op->getOperand(0), oldDest,
+                                 ValueRange(), newBlock, ValueRange());
+        rewriter.eraseOp(oldTerminator);
+      }
+    }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct TestGreedyPatternDriver
     : public PassWrapper<TestGreedyPatternDriver, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestGreedyPatternDriver)
@@ -486,7 +561,7 @@ struct TestGreedyPatternDriver
     patterns.add<FoldingPattern, TestNamedPatternRule,
                  FolderInsertBeforePreviouslyFoldedConstantPattern,
                  FolderCommutativeOp2WithConstant, HoistEligibleOps,
-                 MakeOpEligible>(&getContext());
+                 MakeOpEligible, CreateBlockDuringGreedyRewrite>(&getContext());
 
     // Additional patterns for testing the GreedyPatternRewriteDriver.
     patterns.insert<IncrementIntAttribute<3>>(&getContext());

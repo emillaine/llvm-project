@@ -75,8 +75,8 @@ func.func @test_replace_with_erase_op() {
 //       CHECK-AN: return
 //       CHECK-AN: ^[[BB1:[^:]*]]:
 //       CHECK-AN: "test.implicit_change_op"()[^[[BB1]]]
-func.func @test_trigger_rewrite_through_block() {
-  return
+func.func @test_trigger_rewrite_through_block(%cond: i1) {
+  cf.cond_br %cond, ^bb1, ^bb3
 ^bb1:
   // Uses bb1. ChangeBlockOp replaces that and all other usages of bb1 with bb2.
   "test.change_block_op"() [^bb1, ^bb2] : () -> ()
@@ -87,6 +87,22 @@ func.func @test_trigger_rewrite_through_block() {
   // this op being put on the worklist, which triggers ImplicitChangeOp, which,
   // in turn, replaces the successor with bb3.
   "test.implicit_change_op"() [^bb1] : () -> ()
+}
+
+// -----
+
+// Explicitly selected operations in unreachable blocks are skipped.
+// CHECK-AN-LABEL: func @test_skip_unreachable
+// CHECK-AN-SAME: pattern_driver_all_erased = false, pattern_driver_changed = false
+// CHECK-AN: "test.erase_op"()
+// CHECK-EN-LABEL: func @test_skip_unreachable
+// CHECK-EN-SAME: pattern_driver_all_erased = false, pattern_driver_changed = false
+// CHECK-EN: "test.erase_op"()
+func.func @test_skip_unreachable() {
+  return
+^dead:
+  "test.erase_op"() : () -> ()
+  return
 }
 
 // -----
